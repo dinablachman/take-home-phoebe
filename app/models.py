@@ -4,7 +4,7 @@ Example domain models. Implement or replace as needed.
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Caregiver(BaseModel):
@@ -24,4 +24,4 @@ class Shift(BaseModel):
     claimed_by: str | None = None  # Caregiver ID
     claimed_at: datetime | None = None
     fanout_started_at: datetime | None = None
-    declined_caregiver_ids: list[str] = []  # Caregiver IDs who declined
+    declined_caregiver_ids: list[str] = Field(default_factory=list)
