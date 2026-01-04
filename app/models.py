@@ -21,6 +21,7 @@ class Shift(BaseModel):
     start_time: datetime
     end_time: datetime
     claimed: bool = False  # True when shift is assigned to caregiver
-    claimed_by: str | None = None  # Caregiver.id
-    claimed_at: datetime | None = None  # record time of shift assignment
-    fanout_started_at: datetime | None = None  # record time of shift fanout
+    claimed_by: str | None = None  # Caregiver ID
+    claimed_at: datetime | None = None
+    fanout_started_at: datetime | None = None
+    declined_caregiver_ids: list[str] = []  # Caregiver IDs who declined
