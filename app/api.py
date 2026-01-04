@@ -59,9 +59,22 @@ async def fanout_shift(shift_id: str, request: Request) -> dict:
         if isinstance(c, Caregiver) and c.role == shift.role_required
     ]
 
+    # Re-fetch shift to get latest state before setting timestamp (race condition protection)
+    current_shift = database.get(f"shift:{shift_id}")
+    if not current_shift or not isinstance(current_shift, Shift):
+        raise HTTPException(status_code=404, detail="Shift not found")
+
+    # Check again if fanout already started (using latest state)
+    if current_shift.fanout_started_at is not None:
+        return {
+            "shift_id": shift_id,
+            "status": "already_fanout",
+            "fanout_started_at": current_shift.fanout_started_at.isoformat(),
+        }
+
     # Set fanout_started_at timestamp
-    shift.fanout_started_at = datetime.now(UTC)
-    database.put(f"shift:{shift_id}", shift)
+    current_shift.fanout_started_at = datetime.now(UTC)
+    database.put(f"shift:{shift_id}", current_shift)
 
     # Send SMS to all qualifying caregivers concurrently
     # Include shift_id in message for response handling
@@ -73,16 +86,24 @@ async def fanout_shift(shift_id: str, request: Request) -> dict:
     await asyncio.gather(*sms_tasks)
 
     # Start escalation timer (Round 2: phone calls after 10 minutes)
+    # Store task reference to prevent garbage collection
     escalation_task = asyncio.create_task(
         escalate_if_unfilled(shift_id, request.app.state.database)
     )
-    # Task runs in background, we don't need to await it
+    # Store task in app state to keep reference alive
+    if not hasattr(request.app.state, "escalation_tasks"):
+        request.app.state.escalation_tasks = set()
+    request.app.state.escalation_tasks.add(escalation_task)
+    # Remove task from set when it completes
+    escalation_task.add_done_callback(
+        request.app.state.escalation_tasks.discard
+    )
 
     return {
         "shift_id": shift_id,
-        "role_required": shift.role_required,
+        "role_required": current_shift.role_required,
         "qualifying_caregivers": len(qualifying_caregivers),
-        "fanout_started_at": shift.fanout_started_at.isoformat(),
+        "fanout_started_at": current_shift.fanout_started_at.isoformat(),
     }
 
 
@@ -123,30 +144,33 @@ async def handle_inbound_message(
 
     # Handle ACCEPT intent
     if intent == ShiftRequestMessageIntent.ACCEPT:
-        # Re-fetch shift from database to get latest state
-        current_shift = database.get(f"shift:{message.shift_id}")
-        if not current_shift or not isinstance(current_shift, Shift):
+        # Verify shift exists
+        shift = database.get(f"shift:{message.shift_id}")
+        if not shift or not isinstance(shift, Shift):
             raise HTTPException(status_code=404, detail="Shift not found")
 
-        # Check if already claimed, using latest state from database
-        if current_shift.claimed:
-            return {
-                "status": "already_claimed",
-                "shift_id": message.shift_id,
-                "message": "Shift has already been claimed by another caregiver",
-            }
+        # Atomically claim the shift
+        claimed_at = datetime.now(UTC)
+        claim_succeeded = database.claim_shift_if_unclaimed(
+            f"shift:{message.shift_id}", caregiver.id, claimed_at
+        )
 
-        # Claim the shift
-        current_shift.claimed = True
-        current_shift.claimed_by = caregiver.id
-        current_shift.claimed_at = datetime.now(UTC)
-        database.put(f"shift:{message.shift_id}", current_shift)
+        if not claim_succeeded:
+            # Shift was already claimed or doesn't exist
+            current_shift = database.get(f"shift:{message.shift_id}")
+            if current_shift and isinstance(current_shift, Shift):
+                return {
+                    "status": "already_claimed",
+                    "shift_id": message.shift_id,
+                    "message": "Shift has already been claimed by another caregiver",
+                }
+            raise HTTPException(status_code=404, detail="Shift not found")
 
         return {
             "status": "claimed",
             "shift_id": message.shift_id,
             "caregiver_id": caregiver.id,
-            "claimed_at": current_shift.claimed_at.isoformat(),
+            "claimed_at": claimed_at.isoformat(),
         }
 
     # Handle DECLINE intent - track declined caregiver
