@@ -40,7 +40,7 @@ async def fanout_shift(shift_id: str, request: Request) -> dict:
     if not shift or not isinstance(shift, Shift):
         raise HTTPException(status_code=404, detail="Shift not found")
 
-    # idempotency: set before any awaits so concurrent calls can’t interleave here
+    # idempotency: set before any awaits so concurrent calls can't interleave here
     if shift.fanout_started_at is not None:
         return {
             "shift_id": shift_id,
