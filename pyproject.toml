@@ -1,0 +1,45 @@
+[project]
+name = "app"
+version = "0.0.0"
+requires-python = "==3.13.5"
+dependencies = [
+    "fastapi>=0.115.14",
+    "httpx>=0.28.1",
+    "pydantic>=2.11.7",
+    "uvicorn>=0.35.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.12.1",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.0.0",
+    "freezegun>=1.5.2",
+]
+
+[tool.ruff]
+line-length = 80
+
+[tool.ruff.lint]
+select = [
+    "B",
+    "C4",
+    "DTZ",
+    "E",
+    "F",
+    "FAST",
+    "I",
+    "PERF",
+    "RUF",
+    "T20",
+    "TID",
+    "UP",
+]
+ignore = [
+    "E501",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["*.py"]

@@ -1,0 +1,45 @@
+{
+    "caregivers": [
+      {
+        "id": "27e8d156-7fee-4f79-94d7-b45d306724d4",
+        "name": "Alice Ongwele",
+        "role": "RN",
+        "phone": "+15550001"
+      },
+      {
+        "id": "b7e6a0f4-4c32-44dd-8a6d-ec6b7e9477da",
+        "name": "Wei Yan",
+        "role": "LPN",
+        "phone": "+15550002"
+      },
+      {
+        "id": "c3d4e5f6-g7h8-9012-cdef-345678901234",
+        "name": "Barry Kozumikov",
+        "role": "LPN",
+        "phone": "+15550003"
+      }
+    ],
+    "shifts": [
+      {
+        "id": "f5a9d844-ecff-4f7a-8ef7-d091f22ad77e",
+        "organization_id": "672b5b2a-9a2a-4e55-b0b0-243e0fd4caf5",
+        "role_required": "RN",
+        "start_time": "2025-07-02T08:00:00Z",
+        "end_time": "2025-07-02T16:00:00Z"
+      },
+      {
+        "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "organization_id": "672b5b2a-9a2a-4e55-b0b0-243e0fd4caf5",
+        "role_required": "LPN",
+        "start_time": "2025-07-02T16:00:00Z",
+        "end_time": "2025-07-03T00:00:00Z"
+      },
+      {
+        "id": "b2c3d4e5-f6g7-8901-bcde-f23456789012",
+        "organization_id": "672b5b2a-9a2a-4e55-b0b0-243e0fd4caf5",
+        "role_required": "RN",
+        "start_time": "2025-07-03T00:00:00Z",
+        "end_time": "2025-07-03T08:00:00Z"
+      }
+    ]
+  }
