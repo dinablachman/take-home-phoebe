@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
@@ -10,15 +11,18 @@ from app.intent import (
     parse_shift_request_message_intent,
 )
 from app.models import Caregiver, Shift
-from app.notifier import send_sms
+from app.notifier import place_phone_call, send_sms
 
 router = APIRouter()
 
+NowFn = Callable[[], datetime]
+SleepFn = Callable[[float], Awaitable[None]]
+
 
 class InboundMessageRequest(BaseModel):
-    from_: str = Field(alias="from")  # Phone number
-    body: str  # Message text
-    shift_id: str  # Shift identifier
+    from_: str = Field(alias="from")
+    body: str
+    shift_id: str
 
 
 @router.get("/health")
@@ -28,22 +32,15 @@ async def health_check() -> dict[str, str]:
 
 @router.post("/shifts/{shift_id}/fanout")
 async def fanout_shift(shift_id: str, request: Request) -> dict:
-    """
-    Trigger fanout for a shift.
-    Round 1: Send SMS to qualifying caregivers.
-    Idempotent: re-posting will not send duplicate notifications.
-    """
-    # Get database from app state
-    database: InMemoryKeyValueDatabase[str, Shift | Caregiver] = (
+    db: InMemoryKeyValueDatabase[str, Shift | Caregiver] = (
         request.app.state.database
     )
 
-    # Get shift from database
-    shift = database.get(f"shift:{shift_id}")
+    shift = db.get(f"shift:{shift_id}")
     if not shift or not isinstance(shift, Shift):
         raise HTTPException(status_code=404, detail="Shift not found")
 
-    # Idempotency check: if fanout already started, return early
+    # idempotency: set before any awaits so concurrent calls can’t interleave here
     if shift.fanout_started_at is not None:
         return {
             "shift_id": shift_id,
@@ -51,59 +48,40 @@ async def fanout_shift(shift_id: str, request: Request) -> dict:
             "fanout_started_at": shift.fanout_started_at.isoformat(),
         }
 
-    # Filter caregivers by role_required
-    all_caregivers = database.all()
-    qualifying_caregivers = [
+    shift.fanout_started_at = request.app.state.now_fn()
+    db.put(f"shift:{shift_id}", shift)
+
+    caregivers = [
         c
-        for c in all_caregivers
+        for c in db.all()
         if isinstance(c, Caregiver) and c.role == shift.role_required
     ]
 
-    # Re-fetch shift to get latest state before setting timestamp (race condition protection)
-    current_shift = database.get(f"shift:{shift_id}")
-    if not current_shift or not isinstance(current_shift, Shift):
-        raise HTTPException(status_code=404, detail="Shift not found")
-
-    # Check again if fanout already started (using latest state)
-    if current_shift.fanout_started_at is not None:
-        return {
-            "shift_id": shift_id,
-            "status": "already_fanout",
-            "fanout_started_at": current_shift.fanout_started_at.isoformat(),
-        }
-
-    # Set fanout_started_at timestamp
-    current_shift.fanout_started_at = datetime.now(UTC)
-    database.put(f"shift:{shift_id}", current_shift)
-
-    # Send SMS to all qualifying caregivers concurrently
-    # Include shift_id in message for response handling
     message = f"Shift {shift_id} available. Reply 'yes' to accept."
-    sms_tasks = [
-        send_sms(caregiver.phone, message)
-        for caregiver in qualifying_caregivers
-    ]
-    await asyncio.gather(*sms_tasks)
+    await asyncio.gather(*(send_sms(c.phone, message) for c in caregivers))
 
-    # Start escalation timer (Round 2: phone calls after 10 minutes)
-    # Store task reference to prevent garbage collection
-    escalation_task = asyncio.create_task(
-        escalate_if_unfilled(shift_id, request.app.state.database)
+    task = asyncio.create_task(
+        escalate_if_unfilled(
+            shift_id,
+            db,
+            now_fn=request.app.state.now_fn,
+            sleep_fn=request.app.state.sleep_fn,
+        )
     )
-    # Store task in app state to keep reference alive
-    if not hasattr(request.app.state, "escalation_tasks"):
-        request.app.state.escalation_tasks = set()
-    request.app.state.escalation_tasks.add(escalation_task)
-    # Remove task from set when it completes
-    escalation_task.add_done_callback(
-        request.app.state.escalation_tasks.discard
-    )
+    request.app.state.escalation_tasks.add(task)
+    request.app.state.escalation_tasks_by_shift[shift_id] = task
+
+    def _cleanup(_t: asyncio.Task) -> None:
+        request.app.state.escalation_tasks.discard(_t)
+        request.app.state.escalation_tasks_by_shift.pop(shift_id, None)
+
+    task.add_done_callback(_cleanup)
 
     return {
         "shift_id": shift_id,
-        "role_required": current_shift.role_required,
-        "qualifying_caregivers": len(qualifying_caregivers),
-        "fanout_started_at": current_shift.fanout_started_at.isoformat(),
+        "role_required": shift.role_required,
+        "qualifying_caregivers": len(caregivers),
+        "fanout_started_at": shift.fanout_started_at.isoformat(),
     }
 
 
@@ -111,20 +89,14 @@ async def fanout_shift(shift_id: str, request: Request) -> dict:
 async def handle_inbound_message(
     message: InboundMessageRequest, request: Request
 ) -> dict:
-    """
-    Handle incoming SMS/phone message from caregiver.
-    """
-    # Get database from app state
-    database: InMemoryKeyValueDatabase[str, Shift | Caregiver] = (
+    db: InMemoryKeyValueDatabase[str, Shift | Caregiver] = (
         request.app.state.database
     )
 
-    # Find caregiver by phone number
-    all_caregivers = database.all()
     caregiver = next(
         (
             c
-            for c in all_caregivers
+            for c in db.all()
             if isinstance(c, Caregiver) and c.phone == message.from_
         ),
         None,
@@ -134,37 +106,29 @@ async def handle_inbound_message(
             status_code=404, detail="Caregiver not found for phone number"
         )
 
-    # Get shift from database
-    shift = database.get(f"shift:{message.shift_id}")
+    shift = db.get(f"shift:{message.shift_id}")
     if not shift or not isinstance(shift, Shift):
         raise HTTPException(status_code=404, detail="Shift not found")
 
-    # Parse message intent
     intent = await parse_shift_request_message_intent(message.body)
 
-    # Handle ACCEPT intent
     if intent == ShiftRequestMessageIntent.ACCEPT:
-        # Verify shift exists
-        shift = database.get(f"shift:{message.shift_id}")
-        if not shift or not isinstance(shift, Shift):
-            raise HTTPException(status_code=404, detail="Shift not found")
-
-        # Atomically claim the shift
-        claimed_at = datetime.now(UTC)
-        claim_succeeded = database.claim_shift_if_unclaimed(
+        claimed_at = request.app.state.now_fn()
+        claimed = db.claim_shift_if_unclaimed(
             f"shift:{message.shift_id}", caregiver.id, claimed_at
         )
 
-        if not claim_succeeded:
-            # Shift was already claimed or doesn't exist
-            current_shift = database.get(f"shift:{message.shift_id}")
-            if current_shift and isinstance(current_shift, Shift):
-                return {
-                    "status": "already_claimed",
-                    "shift_id": message.shift_id,
-                    "message": "Shift has already been claimed by another caregiver",
-                }
-            raise HTTPException(status_code=404, detail="Shift not found")
+        if not claimed:
+            return {
+                "status": "already_claimed",
+                "shift_id": message.shift_id,
+                "message": "Shift has already been claimed by another caregiver",
+            }
+
+        # cancel escalation (if sleeping)
+        task = request.app.state.escalation_tasks_by_shift.get(message.shift_id)
+        if task is not None:
+            task.cancel()
 
         return {
             "status": "claimed",
@@ -173,18 +137,11 @@ async def handle_inbound_message(
             "claimed_at": claimed_at.isoformat(),
         }
 
-    # Handle DECLINE intent - track declined caregiver
     if intent == ShiftRequestMessageIntent.DECLINE:
-        # Re-fetch shift from database to get latest state
-        current_shift = database.get(f"shift:{message.shift_id}")
-        if not current_shift or not isinstance(current_shift, Shift):
-            raise HTTPException(status_code=404, detail="Shift not found")
+        if caregiver.id not in shift.declined_caregiver_ids:
+            shift.declined_caregiver_ids.append(caregiver.id)
+            db.put(f"shift:{message.shift_id}", shift)
 
-        if caregiver.id not in current_shift.declined_caregiver_ids:
-            current_shift.declined_caregiver_ids.append(caregiver.id)
-            database.put(f"shift:{message.shift_id}", current_shift)
-
-    # Handle DECLINE or UNKNOWN intents
     return {
         "status": "not_claimed",
         "shift_id": message.shift_id,
@@ -193,58 +150,64 @@ async def handle_inbound_message(
 
 
 async def escalate_if_unfilled(
-    shift_id: str, database: InMemoryKeyValueDatabase[str, Shift | Caregiver]
+    shift_id: str,
+    db: InMemoryKeyValueDatabase[str, Shift | Caregiver],
+    *,
+    now_fn: NowFn,
+    sleep_fn: SleepFn,
 ) -> None:
-    """
-    Background task that escalates to phone calls if shift is not claimed
-    within 10 minutes. Uses time comparison (freezegun-friendly).
-    """
-    # Get shift to find when fanout started
-    shift = database.get(f"shift:{shift_id}")
-    if not shift or not isinstance(shift, Shift):
-        return  # Shift doesn't exist
+    shift = db.get(f"shift:{shift_id}")
+    if (
+        not shift
+        or not isinstance(shift, Shift)
+        or shift.fanout_started_at is None
+    ):
+        return
 
-    if shift.fanout_started_at is None:
-        return  # Fanout never started
+    start = shift.fanout_started_at
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
 
-    # Normalize fanout_started_at to UTC-aware datetime
-    fanout_started_at = shift.fanout_started_at
-    if fanout_started_at.tzinfo is None:
-        # Assume naive datetime is UTC
-        fanout_started_at = fanout_started_at.replace(tzinfo=UTC)
+    target = start + timedelta(minutes=10)
 
-    # Calculate target time (10 minutes after fanout started)
-    target_time = fanout_started_at + timedelta(minutes=10)
+    try:
+        remaining = (target - now_fn()).total_seconds()
+        if remaining > 0:
+            await sleep_fn(remaining)
 
-    # Wait until target time, checking periodically
-    while True:
-        current_time = datetime.now(UTC)
+        shift = db.get(f"shift:{shift_id}")
+        if not shift or not isinstance(shift, Shift) or shift.claimed:
+            return
 
-        # Check if shift was claimed (exit early if claimed)
-        shift = database.get(f"shift:{shift_id}")
-        if not shift or not isinstance(shift, Shift):
-            return  # Shift deleted
-        if shift.claimed:
-            return  # Shift was claimed, no escalation needed
+        caregivers = [
+            c
+            for c in db.all()
+            if isinstance(c, Caregiver)
+            and c.role == shift.role_required
+            and c.id not in shift.declined_caregiver_ids
+        ]
 
-        # Check if 10 minutes have passed
-        if current_time >= target_time:
-            # TODO: Send phone calls to qualifying caregivers
-            # (excluding those who declined)
-            break
+        message = f"Shift {shift_id} available. Reply 'yes' to accept."
+        await asyncio.gather(
+            *(place_phone_call(c.phone, message) for c in caregivers)
+        )
 
-        # Small sleep before checking again
-        await asyncio.sleep(0.1)
+    except asyncio.CancelledError:
+        return
 
 
 def create_app() -> FastAPI:
     app = FastAPI()
-
-    # Initialize database
-    database: InMemoryKeyValueDatabase[str, Shift | Caregiver] = (
+    db: InMemoryKeyValueDatabase[str, Shift | Caregiver] = (
         InMemoryKeyValueDatabase()
     )
-    app.state.database = database
+    app.state.database = db
+
+    app.state.now_fn = lambda: datetime.now(UTC)
+    app.state.sleep_fn = asyncio.sleep
+
+    app.state.escalation_tasks = set()
+    app.state.escalation_tasks_by_shift = {}
 
     app.include_router(router)
     return app
