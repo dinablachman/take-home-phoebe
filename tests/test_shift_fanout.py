@@ -15,7 +15,7 @@ from app.models import Caregiver, Shift
 
 def _p(msg: str) -> None:
     # pytest captures stdout unless you run with -s
-    print(msg, flush=True)
+    print(msg, flush=True)  # noqa: T201
 
 
 def _banner(name: str) -> None:
