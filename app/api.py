@@ -183,8 +183,14 @@ async def escalate_if_unfilled(
     if shift.fanout_started_at is None:
         return  # Fanout never started
 
+    # Normalize fanout_started_at to UTC-aware datetime
+    fanout_started_at = shift.fanout_started_at
+    if fanout_started_at.tzinfo is None:
+        # Assume naive datetime is UTC
+        fanout_started_at = fanout_started_at.replace(tzinfo=UTC)
+
     # Calculate target time (10 minutes after fanout started)
-    target_time = shift.fanout_started_at + timedelta(minutes=10)
+    target_time = fanout_started_at + timedelta(minutes=10)
 
     # Wait until target time, checking periodically
     while True:
